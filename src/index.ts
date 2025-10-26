@@ -26,3 +26,4 @@ export const jupiterPlugin: Plugin = {
 };
 
 export default jupiterPlugin;
+export { JupiterService } from './service';

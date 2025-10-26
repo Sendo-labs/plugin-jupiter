@@ -9,13 +9,17 @@
     "@elizaos/plugin-solana": "^1.0.0-beta.51"
   },
   "devDependencies": {
-    "tsup": "^8.3.5"
+    "dotenv": "^17.2.3",
+    "tsup": "^8.3.5",
+    "tsx": "^4.20.6"
   },
   "scripts": {
     "build": "tsup --format esm --dts",
     "dev": "tsup --format esm --dts --watch",
     "clean": "rm -rf dist",
-    "lint": "prettier --write ./src"
+    "lint": "prettier --write ./src",
+    "e2e": "node dist/scripts/e2e-mainnet.js",
+    "local:sim": "tsx local-e2e/swap-sign-and-simulate.ts"
   },
   "publishConfig": {
     "access": "public"

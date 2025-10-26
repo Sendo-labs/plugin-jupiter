@@ -1,11 +1,71 @@
 import { Service, logger, type IAgentRuntime } from '@elizaos/core';
-import { Connection } from '@solana/web3.js';
+import { Connection, PublicKey } from '@solana/web3.js';
+import { getAssociatedTokenAddressSync } from '@solana/spl-token';
+import type { ReferralConfig, FeeMode } from './types';
 
 // doesn't matter how many agents since we're coming from a single IP
 // lets respect their service
 const queues = { quotes: [], swaps: [] }
 
-async function getQuoteWithRetry(url, retries = 3, delay = 2000) {
+const WSOL_MINT = 'So11111111111111111111111111111111111111112';
+
+/**
+ * Load referral configuration from environment variables
+ */
+function loadReferralConfig(): ReferralConfig {
+  const feeBps = parseInt(process.env.REFERRAL_FEE_BPS || '0', 10);
+  const mode = (process.env.REFERRAL_MODE || 'smart') as FeeMode;
+  
+  return {
+    enabled: feeBps > 0,
+    feeBps,
+    mode,
+  };
+}
+
+/**
+ * Select the mint to use for fee collection based on mode and swap pair
+ */
+function selectFeeMint(
+  inputMint: string,
+  outputMint: string,
+  mode: FeeMode
+): string | null {
+  if (mode === 'sol_only') {
+    // Prefer SOL/WSOL if available in the pair
+    if (inputMint === WSOL_MINT) return inputMint;
+    if (outputMint === WSOL_MINT) return outputMint;
+    return null; // No SOL in pair, no fee
+  }
+  
+  // Smart mode: prefer SOL if available, otherwise use input mint
+  if (inputMint === WSOL_MINT || outputMint === WSOL_MINT) {
+    return WSOL_MINT;
+  }
+  
+  // Default to input mint for ExactIn compatibility
+  return inputMint;
+}
+
+/**
+ * Derive the associated token account address for a given owner and mint
+ */
+function deriveFeeAccount(
+  ownerPublicKey: string,
+  mint: string
+): string | null {
+  try {
+    const owner = new PublicKey(ownerPublicKey);
+    const mintPubkey = new PublicKey(mint);
+    const ata = getAssociatedTokenAddressSync(mintPubkey, owner);
+    return ata.toBase58();
+  } catch (error) {
+    logger.warn('Failed to derive fee account:', error);
+    return null;
+  }
+}
+
+async function getQuoteWithRetry(url: string, retries = 3, delay = 2000) {
   //console.log('quote', url)
   for (let i = 0; i < retries; i++) {
     console.log('jupSrv - url', url)
@@ -21,11 +81,7 @@ async function getQuoteWithRetry(url, retries = 3, delay = 2000) {
       }
 
       const error = await response.text();
-      logger.warn('Quote request failed:', {
-        url,
-        status: response.status,
-        error,
-      });
+      logger.warn(`Quote request failed: ${url} status=${response.status} error=${error}`);
       // alot of 400s
       // a lot of headers but nothing really useful
       //console.log('quoteResponse', response)
@@ -38,9 +94,9 @@ async function getQuoteWithRetry(url, retries = 3, delay = 2000) {
 }
 
 // could include runtime for logging
-function quoteEnqueue(url) {
-  let resolveHandle = false
-  let rejectHandle = false
+function quoteEnqueue(url: string) {
+  let resolveHandle: any = false
+  let rejectHandle: any = false
   const promise = new Promise((resolve, reject) => {
     resolveHandle = resolve
     rejectHandle = reject
@@ -53,7 +109,7 @@ function quoteEnqueue(url) {
   return promise
 }
 
-async function processQuoteQueue(quote) {
+async function processQuoteQueue(quote: any) {
   try {
     const quoteData = await getQuoteWithRetry(quote.url)
     quote.resolveHandle(quoteData)
@@ -84,9 +140,9 @@ async function checkQuoteQueues() {
 // start checking queues
 checkQuoteQueues()
 
-function swapEnqueue(url, payload) {
-  let resolveHandle = false
-  let rejectHandle = false
+function swapEnqueue(url: string, payload: any) {
+  let resolveHandle: any = false
+  let rejectHandle: any = false
   const promise = new Promise((resolve, reject) => {
     resolveHandle = resolve
     rejectHandle = reject
@@ -100,7 +156,7 @@ function swapEnqueue(url, payload) {
   return promise
 }
 
-async function getSwapWithRetry(url, payload, retries = 3, delay = 2000) {
+async function getSwapWithRetry(url: string, payload: any, retries = 3, delay = 2000) {
   //console.log('swap', url)
   for (let i = 0; i < retries; i++) {
     console.log('jupSrv - swap', payload.body)
@@ -116,11 +172,7 @@ async function getSwapWithRetry(url, payload, retries = 3, delay = 2000) {
       }
 
       const error = await response.text();
-      logger.warn('Swap request failed:', {
-        url,
-        status: response.status,
-        error,
-      });
+      logger.warn(`Swap request failed: ${url} status=${response.status} error=${error}`);
       // alot of 400s
       // a lot of headers but nothing really useful
       //console.log('swapResponse', response)
@@ -132,7 +184,7 @@ async function getSwapWithRetry(url, payload, retries = 3, delay = 2000) {
   throw new Error("Rate limit exceeded, try again later.");
 }
 
-async function processSwapQueue(swap) {
+async function processSwapQueue(swap: any) {
   try {
     const swapData = await getSwapWithRetry(swap.url, swap.payload)
     swap.resolveHandle(swapData)
@@ -166,6 +218,7 @@ checkSwapQueues()
 export class JupiterService extends Service {
   private isRunning = false;
   private registry: Record<number, any> = {};
+  private routeCache: Record<string, any> = {};
 
   static serviceType = 'JUPITER_SERVICE';
   capabilityDescription = 'Provides Jupiter DEX integration for token swaps';
@@ -207,7 +260,7 @@ export class JupiterService extends Service {
     slippageBps: number;
   }) {
     try {
-      const intAmount = parseInt(amount)
+      const intAmount = parseInt(amount.toString())
       if (isNaN(intAmount) || intAmount <= 0) {
         console.warn('jupiter::getQuote - Amount in', amount, 'become', intAmount)
         return false
@@ -218,27 +271,18 @@ export class JupiterService extends Service {
         //console.log('we have a route for', key, this.routeCache[key].routePlan)
       }
 
-      //const quoteData = await this.getQuoteWithRetry(`https://public.jupiterapi.com/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${intAmount}&slippageBps=${slippageBps}&platformFeeBps=200`)
-      // &onlyDirectRoutes=true
-      //   This ensures Jupiter only uses live and fully-initialized pools.
-      // &platformFeeBps=200
-      //const quoteData = await quoteEnqueue(`https://public.jupiterapi.com/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${intAmount}&slippageBps=${slippageBps}`)
-      const quoteData = await quoteEnqueue(`https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${intAmount}&slippageBps=${slippageBps}`)
-      // if api-key then use https://api.jup.ag/swap/v1/quote
-
-      /*
-      if (!quoteResponse.ok) {
-        const error = await quoteResponse.text();
-        logger.warn('Quote request failed:', {
-          status: quoteResponse.status,
-          error,
-        });
-        console.log('quoteResponse', quoteResponse)
-        throw new Error(`Failed to get quote: ${error}`);
+      // Load referral config and add platformFeeBps if enabled
+      const referralConfig = loadReferralConfig();
+      let url = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${intAmount}&slippageBps=${slippageBps}`;
+      
+      if (referralConfig.enabled && referralConfig.feeBps > 0) {
+        url += `&platformFeeBps=${referralConfig.feeBps}`;
+        logger.info(`Referral fees enabled: ${referralConfig.feeBps} bps (${referralConfig.feeBps / 100}%)`);
       }
 
-      const quoteData = await quoteResponse.json();
-      */
+      const quoteData: any = await quoteEnqueue(url);
+      // if api-key then use https://api.jup.ag/swap/v1/quote
+
       quoteData.totalLamportsNeeded = this.estimateLamportsNeeded(quoteData)
       this.routeCache[key] = quoteData
       return quoteData;
@@ -248,7 +292,7 @@ export class JupiterService extends Service {
     }
   }
 
-  estimateLamportsNeeded(initialQuote) {
+  estimateLamportsNeeded(initialQuote: any) {
     // Parse numbers safely
     const platformFee = Number(initialQuote.platformFee?.amount || 0);
 
@@ -289,60 +333,52 @@ export class JupiterService extends Service {
     slippageBps: number;
   }) {
     try {
-      //console.log('executeSwap slippageBps', slippageBps)
-      const body = {
+      const body: any = {
         quoteResponse: {
           ...quoteResponse,
           slippageBps,
         },
         userPublicKey,
-        //slippageBps,
         wrapAndUnwrapSol: true,
         computeUnitPriceMicroLamports: 5_000_000,
         dynamicComputeUnitLimit: true,
       };
-      //console.log('executeSwap - body', body)
-      //console.log('userPublicKey', userPublicKey, 'body', body)
 
+      // Add feeAccount if referral is enabled
+      const referralConfig = loadReferralConfig();
+      if (referralConfig.enabled && referralConfig.feeBps > 0) {
+        const inputMint = (quoteResponse as any).inputMint;
+        const outputMint = (quoteResponse as any).outputMint;
+        
+        if (inputMint && outputMint) {
+          const selectedMint = selectFeeMint(inputMint, outputMint, referralConfig.mode);
+          
+          if (selectedMint) {
+            const feeReceiver = process.env.REFERRAL_FEE_RECEIVER;
+            if (!feeReceiver) {
+              logger.warn('REFERRAL_FEE_RECEIVER not set. Swap will proceed without fees.');
+            }
 
-      /*
-      const swapData = await swapEnqueue('https://quote-api.jup.ag/v6/swap', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-      */
+            const feeAccount = feeReceiver ? deriveFeeAccount(feeReceiver, selectedMint) : null;
+            
+            if (feeAccount) {
+              body.feeAccount = feeAccount;
+              logger.info(`Fee account added: ${feeAccount} for mint ${selectedMint}`);
+            } else {
+              logger.warn(`Could not derive fee account for mint ${selectedMint}. Swap will proceed without fees.`);
+            }
+          } else {
+            logger.warn(`No suitable mint for fees in ${referralConfig.mode} mode. Swap will proceed without fees.`);
+          }
+        }
+      }
+
       const swapData = await swapEnqueue('https://lite-api.jup.ag/swap/v1/swap', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
 
-
-      /*
-      // what's wrong with this url?
-      //const swapResponse = await fetch('https://public.jupiterapi.com/swap', {
-      const swapResponse = await fetch('https://quote-api.jup.ag/v6/swap', {
-      // Route not found
-      //const swapResponse = await fetch('https://lite-api.jup.ag/v1/swap', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-
-      if (!swapResponse.ok) {
-        if (swapResponse.status === 429) {
-          // , response.headers has no rate limit headers
-          console.log('swap 429d')
-          // probably should retry in a bit
-        }
-        const error = await swapResponse.text();
-        throw new Error(`Failed to get swap transaction: ${error}`);
-      }
-      //console.log('swapResponse response', swapResponse)
-
-      return await swapResponse.json();
-      */
       return swapData
     } catch (error) {
       logger.error('Error executing Jupiter swap:', error);
@@ -388,7 +424,7 @@ export class JupiterService extends Service {
   ): Promise<number> {
     try {
       const baseAmount = 10 ** inputDecimals;
-      const quote = await this.getQuote({
+      const quote: any = await this.getQuote({
         inputMint: tokenMint,
         outputMint: quoteMint,
         amount: baseAmount, // Dynamic amount based on token decimals
@@ -628,7 +664,7 @@ export class JupiterService extends Service {
       for (const token1 of commonTokens) {
         if (token1 === startingMint) continue;
 
-        const quote1 = await this.getQuote({
+        const quote1: any = await this.getQuote({
           inputMint: startingMint,
           outputMint: token1,
           amount,
@@ -638,14 +674,14 @@ export class JupiterService extends Service {
         for (const token2 of commonTokens) {
           if (token2 === token1 || token2 === startingMint) continue;
 
-          const quote2 = await this.getQuote({
+          const quote2: any = await this.getQuote({
             inputMint: token1,
             outputMint: token2,
             amount: Number(quote1.outAmount),
             slippageBps: 50,
           });
 
-          const finalQuote = await this.getQuote({
+          const finalQuote: any = await this.getQuote({
             inputMint: token2,
             outputMint: startingMint,
             amount: Number(quote2.outAmount),
@@ -728,8 +764,8 @@ export class JupiterService extends Service {
 }
 
 // hack these in here
-async function getCacheExp(runtime, key) {
-  const wrapper = await runtime.getCache<any>(key);
+async function getCacheExp(runtime: any, key: string) {
+  const wrapper = await runtime.getCache(key);
   // if exp is in the past
   if (wrapper.exp < Date.now()) {
     // no data
@@ -737,9 +773,9 @@ async function getCacheExp(runtime, key) {
   }
   return wrapper.data
 }
-async function setCacheExp(runtime, key, val, ttlInSecs) {
+async function setCacheExp(runtime: any, key: string, val: any, ttlInSecs: number) {
   const exp = Date.now() + ttlInSecs * 1_000
-  return runtime.setCache<any>(key, {
+  return runtime.setCache(key, {
     exp,
     data: val,
   });

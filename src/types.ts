@@ -30,3 +30,16 @@ export interface JupiterSwapResponse {
   lastValidBlockHeight: number;
   prioritizationFeeLamports: number;
 }
+
+export type FeeMode = 'sol_only' | 'smart';
+
+export interface ReferralConfig {
+  enabled: boolean;
+  feeBps: number;
+  mode: FeeMode;
+}
+
+export interface FeeMintSelection {
+  mint: string;
+  feeAccount?: string;
+}
